@@ -348,7 +348,7 @@ static void PingPong_Process(void)
     uint8_t payloadSize = sizeof(txString) - 1;
 
     // 2. Wait 2 seconds before sending the next update
-    HAL_Delay(2000);
+    HAL_Delay(500);
 
     // 3. Copy the string to the transmission buffer
     memcpy(BufferTx, txString, payloadSize);

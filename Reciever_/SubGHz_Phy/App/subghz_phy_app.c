@@ -290,17 +290,6 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t LoraS
   }
   /* Record Received Signal Strength*/
   RssiValue = rssi;
-  /* Record payload content*/
-  APP_LOG(TS_ON, VLEVEL_H, "payload. size=%d \n\r", size);
-  for (int i = 0; i < PAYLOAD_LEN; i++)
-  {
-    APP_LOG(TS_OFF, VLEVEL_H, "%02X", BufferRx[i]);
-    if (i % 16 == 15)
-    {
-      APP_LOG(TS_OFF, VLEVEL_H, "\n\r");
-    }
-  }
-  APP_LOG(TS_OFF, VLEVEL_H, "\n\r");
   /* Run PingPong process in background*/
   UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
   /* USER CODE END OnRxDone */
@@ -342,31 +331,33 @@ static void OnRxError(void)
 /* USER CODE BEGIN PrFD */
 static void PingPong_Process(void)
 {
-  // Note: We removed Radio.Sleep() because a receiver must never sleep!
-
+  // The receiver does not sleep; it must always listen for the car's telemetry.
+  
   switch (State)
   {
     case RX:
-      if (RxBufferSize > 0)
+      // Ensure we only process packets that match our exact struct size (36 bytes)
+      if (RxBufferSize == 36) 
       {
-        // Add a safety null terminator to the end of the packet data
-        if (RxBufferSize < MAX_APP_BUFFER_SIZE)
+        // Translate the raw binary into a clean Hexadecimal string
+        for (int i = 0; i < RxBufferSize; i++)
         {
-          BufferRx[RxBufferSize] = '\0';
+          APP_LOG(TS_OFF, VLEVEL_ALWAYS, "%02X", BufferRx[i]);
         }
-
-        // Print the human-readable car telemetry directly to your laptop console
-        APP_LOG(TS_ON, VLEVEL_L, "DATA MATCH: %s | RSSI: %d dBm\r\n", (char*)BufferRx, RssiValue);
+        
+        // Add a carriage return and newline (\r\n) to act as the packet boundary 
+        // This is crucial for the Python readline() function to work correctly.
+        APP_LOG(TS_OFF, VLEVEL_ALWAYS, "\r\n"); 
       }
-
-      // Turn the radio receiver back on immediately for the next packet
+      
+      // Turn the radio receiver back on immediately to catch the next packet
       Radio.Rx(0);
       break;
 
     case RX_TIMEOUT:
     case RX_ERROR:
     default:
-      // If a glitch or timeout occurs, restart the receiver immediately
+      // If a glitch, timeout, or error occurs, instantly restart the receiver
       Radio.Rx(0);
       break;
   }
