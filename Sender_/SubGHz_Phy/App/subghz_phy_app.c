@@ -1,33 +1,8 @@
-/*!
- * \file      subghz_phy_app.c
- *
- * \brief     Ping-Pong implementation
- *
- * \copyright Revised BSD License, see section \ref LICENSE.
- *
- * \code
- *                ______                              _
- *               / _____)             _              | |
- *              ( (____  _____ ____ _| |_ _____  ____| |__
- *               \____ \| ___ |    (_   _) ___ |/ ___)  _ \
- *               _____) ) ____| | | || |_| ____( (___| | | |
- *              (______/|_____)_|_|_| \__)_____)\____)_| |_|
- *              (C)2013-2017 Semtech
- *
- * \endcode
- *
- * \author    Miguel Luis ( Semtech )
- *
- * \author    Gregory Cristian ( Semtech )
- */
 /**
   ******************************************************************************
-  *
-  *          Portions COPYRIGHT 2020 STMicroelectronics
-  *
   * @file    subghz_phy_app.c
-  * @author  MCD Application Team
-  * @brief   Application of the SubGHz_Phy Middleware
+  * @author  MCD Application Team / Custom DAQ Node
+  * @brief   Application of the SubGHz_Phy Middleware (Car Transmitter - SPI2 SLAVE)
   ******************************************************************************
   */
 
@@ -42,16 +17,37 @@
 #include "stm32_timer.h"
 #include "stm32_seq.h"
 #include "utilities_def.h"
+#include <stdio.h>
 /* USER CODE END Includes */
 
-/* External variables ---------------------------------------------------------*/
-/* USER CODE BEGIN EV */
-
-/* USER CODE END EV */
-
 /* Private typedef -----------------------------------------------------------*/
-
 /* USER CODE BEGIN PTD */
+
+// --- NEW TELEMETRY DATA STRUCTURE (49 Bytes) ---
+// This exactly mirrors the ESP32 C++ Struct
+#pragma pack(1)
+typedef struct {
+    uint8_t  sync1;       // 0xAA
+    uint8_t  sync2;       // 0xBB
+    uint16_t packet_id;
+    uint16_t rpm;
+    float    mcu_temp;
+    float    motor_temp;
+    float    ax;
+    float    ay;
+    float    az;
+    float    yaw;
+    float    pitch;
+    float    roll;
+    uint16_t pot1;
+    uint16_t pot2;
+    uint16_t pot3;
+    uint16_t pot4;
+    uint16_t pot5;
+    uint8_t  checksum;
+} TelemetryPacket;
+#pragma pack()
+
 typedef enum
 {
   RX,
@@ -63,122 +59,98 @@ typedef enum
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-/* Configurations */
-/*Timeout*/
 #define RX_TIMEOUT_VALUE              3000
 #define TX_TIMEOUT_VALUE              3000
-/* PING string*/
-#define PING "PING"
-/* PONG string*/
-#define PONG "PONG"
-/*Size of the payload to be sent*/
-/* Size must be greater of equal the PING and PONG*/
-#define MAX_APP_BUFFER_SIZE          255
-#if (PAYLOAD_LEN > MAX_APP_BUFFER_SIZE)
-#error PAYLOAD_LEN must be less or equal than MAX_APP_BUFFER_SIZE
-#endif /* (PAYLOAD_LEN > MAX_APP_BUFFER_SIZE) */
-/* wait for remote to be in Rx, before sending a Tx frame*/
-#define RX_TIME_MARGIN                50
-/* Afc bandwidth in Hz */
-#define FSK_AFC_BANDWIDTH             83333
-/* LED blink Period*/
+#define MAX_APP_BUFFER_SIZE           255
 #define LED_PERIOD_MS                 200
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-/* Radio events function pointer */
 static RadioEvents_t RadioEvents;
-/* USER CODE BEGIN PV */
 
-/*Ping Pong FSM states */
+/* USER CODE BEGIN PV */
+// --- SPI2 & ESP32 VARIABLES ---
+SPI_HandleTypeDef hspi2;  // Changed to hspi2 to avoid naming collision
+TelemetryPacket spiData;
+volatile bool newSpiDataReady = false;
+
+// --- STANDARD VARIABLES ---
 static States_t State = RX;
-/* App Rx Buffer*/
 static uint8_t BufferRx[MAX_APP_BUFFER_SIZE];
-/* App Tx Buffer*/
 static uint8_t BufferTx[MAX_APP_BUFFER_SIZE];
-/* Last  Received Buffer Size*/
 uint16_t RxBufferSize = 0;
-/* Last  Received packer Rssi*/
 int8_t RssiValue = 0;
-/* Last  Received packer SNR (in Lora modulation)*/
 int8_t SnrValue = 0;
-/* Led Timers objects*/
 static UTIL_TIMER_Object_t timerLed;
-/* device state. Master: true, Slave: false*/
-bool isMaster = true;
-/* random delay to make sure 2 devices will sync*/
-/* the closest the random delays are, the longer it will
-   take for the devices to sync when started simultaneously*/
 static int32_t random_delay;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
-/*!
- * @brief Function to be executed on Radio Tx Done event
- */
 static void OnTxDone(void);
-
-/**
-  * @brief Function to be executed on Radio Rx Done event
-  * @param  payload ptr of buffer received
-  * @param  size buffer size
-  * @param  rssi
-  * @param  LoraSnr_FskCfo
-  */
 static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t LoraSnr_FskCfo);
-
-/**
-  * @brief Function executed on Radio Tx Timeout event
-  */
 static void OnTxTimeout(void);
-
-/**
-  * @brief Function executed on Radio Rx Timeout event
-  */
 static void OnRxTimeout(void);
-
-/**
-  * @brief Function executed on Radio Rx Error event
-  */
 static void OnRxError(void);
+static void OnledEvent(void *context);
+static void PingPong_Process(void);
 
 /* USER CODE BEGIN PFP */
-/**
-  * @brief  Function executed on when led timer elapses
-  * @param  context ptr of LED context
-  */
-static void OnledEvent(void *context);
+// --- MANUAL SPI2 SLAVE INITIALIZATION ---
+static void MX_SPI2_Init(void)
+{
+  __HAL_RCC_SPI2_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE(); // SPI2 uses Port B
 
-/**
-  * @brief PingPong state machine implementation
-  */
-static void PingPong_Process(void);
+  // Configure PB12(NSS), PB13(SCK), PB14(MISO), PB15(MOSI)
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitStruct.Pin = GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF0_SPI2;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  // Configure SPI2 in SLAVE mode
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_SLAVE;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES_RXONLY;
+  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi2.Init.NSS = SPI_NSS_HARD_INPUT; // Hardware controls the CS pin
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+
+  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  {
+    while(1) {}
+  }
+
+  // Enable Interrupts for SPI2
+  HAL_NVIC_SetPriority(SPI2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(SPI2_IRQn);
+}
+
+// --- CHECKSUM CALCULATOR ---
+// Validates the integrity of the incoming payload
+uint8_t CalculateChecksum(TelemetryPacket *packet) {
+    uint8_t *bytePtr = (uint8_t *)packet;
+    uint8_t calculatedXOR = 0;
+    // XOR all bytes except the very last one (which is the checksum itself)
+    for (size_t i = 0; i < sizeof(TelemetryPacket) - 1; i++) {
+        calculatedXOR ^= bytePtr[i];
+    }
+    return calculatedXOR;
+}
 /* USER CODE END PFP */
 
 /* Exported functions ---------------------------------------------------------*/
 void SubghzApp_Init(void)
 {
-  /* USER CODE BEGIN SubghzApp_Init_1 */
-  APP_LOG(TS_OFF, VLEVEL_M, "\n\rPING PONG\n\r");
-  /* Print APP version*/
-  APP_LOG(TS_OFF, VLEVEL_M, "APP_VERSION= V%X.%X.%X\r\n",
-          (uint8_t)(__APP_VERSION >> __APP_VERSION_MAIN_SHIFT),
-          (uint8_t)(__APP_VERSION >> __APP_VERSION_SUB1_SHIFT),
-          (uint8_t)(__APP_VERSION >> __APP_VERSION_SUB2_SHIFT));
+  APP_LOG(TS_OFF, VLEVEL_M, "\n\rTELEMETRY DAQ NODE (SPI2 SLAVE)\n\r");
 
-  /* Led Timers*/
   UTIL_TIMER_Create(&timerLed, 0xFFFFFFFFU, UTIL_TIMER_ONESHOT, OnledEvent, NULL);
   UTIL_TIMER_SetPeriod(&timerLed, LED_PERIOD_MS);
   UTIL_TIMER_Start(&timerLed);
-  /* USER CODE END SubghzApp_Init_1 */
 
-  /* Radio initialization */
   RadioEvents.TxDone = OnTxDone;
   RadioEvents.RxDone = OnRxDone;
   RadioEvents.TxTimeout = OnTxTimeout;
@@ -187,20 +159,12 @@ void SubghzApp_Init(void)
 
   Radio.Init(&RadioEvents);
 
-  /*calculate random delay for synchronization*/
-  random_delay = (Radio.Random()) >> 22; /*10bits random e.g. from 0 to 1023 ms*/
+  random_delay = (Radio.Random()) >> 22;
 
-  /* USER CODE BEGIN SubghzApp_Init_2 */
-  /* Radio Set frequency */
+  /* Radio Set frequency - HARDCODED FOR ISOLATION */
   Radio.SetChannel(868100000);
 
-  /* Radio configuration */
 #if ((USE_MODEM_LORA == 1) && (USE_MODEM_FSK == 0))
-  APP_LOG(TS_OFF, VLEVEL_M, "---------------\n\r");
-  APP_LOG(TS_OFF, VLEVEL_M, "LORA_MODULATION\n\r");
-  APP_LOG(TS_OFF, VLEVEL_M, "LORA_BW=%d kHz\n\r", (1 << LORA_BANDWIDTH) * 125);
-  APP_LOG(TS_OFF, VLEVEL_M, "LORA_SF=%d\n\r", LORA_SPREADING_FACTOR);
-
   Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
                     LORA_SPREADING_FACTOR, LORA_CODINGRATE,
                     LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
@@ -212,152 +176,54 @@ void SubghzApp_Init(void)
                     0, true, 0, 0, LORA_IQ_INVERSION_ON, true);
 
   Radio.SetMaxPayloadLength(MODEM_LORA, MAX_APP_BUFFER_SIZE);
+#endif
 
-#elif ((USE_MODEM_LORA == 0) && (USE_MODEM_FSK == 1))
-  APP_LOG(TS_OFF, VLEVEL_M, "---------------\n\r");
-  APP_LOG(TS_OFF, VLEVEL_M, "FSK_MODULATION\n\r");
-  APP_LOG(TS_OFF, VLEVEL_M, "FSK_BW=%d Hz\n\r", FSK_BANDWIDTH);
-  APP_LOG(TS_OFF, VLEVEL_M, "FSK_DR=%d bits/s\n\r", FSK_DATARATE);
-
-  Radio.SetTxConfig(MODEM_FSK, TX_OUTPUT_POWER, FSK_FDEV, 0,
-                    FSK_DATARATE, 0,
-                    FSK_PREAMBLE_LENGTH, FSK_FIX_LENGTH_PAYLOAD_ON,
-                    true, 0, 0, 0, TX_TIMEOUT_VALUE);
-
-  Radio.SetRxConfig(MODEM_FSK, FSK_BANDWIDTH, FSK_DATARATE,
-                    0, FSK_AFC_BANDWIDTH, FSK_PREAMBLE_LENGTH,
-                    0, FSK_FIX_LENGTH_PAYLOAD_ON, 0, true,
-                    0, 0, false, true);
-
-  Radio.SetMaxPayloadLength(MODEM_FSK, MAX_APP_BUFFER_SIZE);
-
-#else
-#error "Please define a modulation in the subghz_phy_app.h file."
-#endif /* USE_MODEM_LORA | USE_MODEM_FSK */
-  /* LED initialization*/
   LED_Init(LED_RED1);
   LED_Init(LED_RED2);
-  /*fills tx buffer*/
   memset(BufferTx, 0x0, MAX_APP_BUFFER_SIZE);
 
-  APP_LOG(TS_ON, VLEVEL_L, "rand=%d\n\r", random_delay);
-  /*starts reception*/
   Radio.Rx(RX_TIMEOUT_VALUE + random_delay);
-  /*register task to to be run in while(1) after Radio IT*/
-  UTIL_SEQ_RegTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), UTIL_SEQ_RFU, PingPong_Process);
+
+  /* USER CODE BEGIN SubghzApp_Init_2 */
+  // Initialize our manual SPI2
+  MX_SPI2_Init();
+
+  // Start listening to the ESP32 in the background continuously on SPI2
+  HAL_SPI_Receive_IT(&hspi2, (uint8_t *)&spiData, sizeof(TelemetryPacket));
   /* USER CODE END SubghzApp_Init_2 */
+
+  UTIL_SEQ_RegTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), UTIL_SEQ_RFU, PingPong_Process);
 }
 
-/* USER CODE BEGIN EF */
-
-/* USER CODE END EF */
-
 /* Private functions ---------------------------------------------------------*/
-
 static void OnTxDone(void)
 {
-  /* USER CODE BEGIN OnTxDone */
-  APP_LOG(TS_ON, VLEVEL_L, "OnTxDone\n\r");
-  /* Update the State of the FSM*/
   State = TX;
-  /* Run PingPong process in background*/
   UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
-  /* USER CODE END OnTxDone */
 }
 
 static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t LoraSnr_FskCfo)
 {
-  /* USER CODE BEGIN OnRxDone */
-  APP_LOG(TS_ON, VLEVEL_L, "OnRxDone\n\r");
-#if ((USE_MODEM_LORA == 1) && (USE_MODEM_FSK == 0))
-  APP_LOG(TS_ON, VLEVEL_L, "RssiValue=%d dBm, SnrValue=%ddB\n\r", rssi, LoraSnr_FskCfo);
-  /* Record payload Signal to noise ratio in Lora*/
-  SnrValue = LoraSnr_FskCfo;
-#endif /* USE_MODEM_LORA | USE_MODEM_FSK */
-#if ((USE_MODEM_LORA == 0) && (USE_MODEM_FSK == 1))
-  APP_LOG(TS_ON, VLEVEL_L, "RssiValue=%d dBm, Cfo=%dkHz\n\r", rssi, LoraSnr_FskCfo);
-  SnrValue = 0; /*not applicable in GFSK*/
-#endif /* USE_MODEM_LORA | USE_MODEM_FSK */
-  /* Update the State of the FSM*/
   State = RX;
-  /* Clear BufferRx*/
-  memset(BufferRx, 0, MAX_APP_BUFFER_SIZE);
-  /* Record payload size*/
-  RxBufferSize = size;
-  if (RxBufferSize <= MAX_APP_BUFFER_SIZE)
-  {
-    memcpy(BufferRx, payload, RxBufferSize);
-  }
-  /* Record Received Signal Strength*/
-  RssiValue = rssi;
-  /* Record payload content*/
-  APP_LOG(TS_ON, VLEVEL_H, "payload. size=%d \n\r", size);
-  for (int i = 0; i < PAYLOAD_LEN; i++)
-  {
-    APP_LOG(TS_OFF, VLEVEL_H, "%02X", BufferRx[i]);
-    if (i % 16 == 15)
-    {
-      APP_LOG(TS_OFF, VLEVEL_H, "\n\r");
-    }
-  }
-  APP_LOG(TS_OFF, VLEVEL_H, "\n\r");
-  /* Run PingPong process in background*/
   UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
-  /* USER CODE END OnRxDone */
 }
 
 static void OnTxTimeout(void)
 {
-  /* USER CODE BEGIN OnTxTimeout */
-  APP_LOG(TS_ON, VLEVEL_L, "OnTxTimeout\n\r");
-  /* Update the State of the FSM*/
   State = TX_TIMEOUT;
-  /* Run PingPong process in background*/
   UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
-  /* USER CODE END OnTxTimeout */
 }
 
 static void OnRxTimeout(void)
 {
-  /* USER CODE BEGIN OnRxTimeout */
-  APP_LOG(TS_ON, VLEVEL_L, "OnRxTimeout\n\r");
-  /* Update the State of the FSM*/
   State = RX_TIMEOUT;
-  /* Run PingPong process in background*/
   UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
-  /* USER CODE END OnRxTimeout */
 }
 
 static void OnRxError(void)
 {
-  /* USER CODE BEGIN OnRxError */
-  APP_LOG(TS_ON, VLEVEL_L, "OnRxError\n\r");
-  /* Update the State of the FSM*/
   State = RX_ERROR;
-  /* Run PingPong process in background*/
   UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
-  /* USER CODE END OnRxError */
-}
-
-/* USER CODE BEGIN PrFD */
-static void PingPong_Process(void)
-{
-  Radio.Sleep();
-  // 1. Define your car's telemetry data
-    char txString[] = "Abara ka dabara gili gili chuu....";
-    uint8_t payloadSize = sizeof(txString) - 1;
-
-    // 2. Wait 2 seconds before sending the next update
-    HAL_Delay(500);
-
-    // 3. Copy the string to the transmission buffer
-    memcpy(BufferTx, txString, payloadSize);
-
-    // 4. Print to the IDE console for debugging, then transmit over LoRa
-    APP_LOG(TS_ON, VLEVEL_L, "Transmitting Car Data...\n\r");
-    Radio.Send(BufferTx, payloadSize);
-
-
 }
 
 static void OnledEvent(void *context)
@@ -367,7 +233,55 @@ static void OnledEvent(void *context)
   UTIL_TIMER_Start(&timerLed);
 }
 
+/* USER CODE BEGIN PrFD */
+
+// Triggered automatically when 49 bytes finish arriving from the ESP32 via SPI2
+void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+  if (hspi->Instance == SPI2)
+  {
+    newSpiDataReady = true;
+
+    // Immediately prime the SPI to catch the next 49 bytes
+    HAL_SPI_Receive_IT(&hspi2, (uint8_t *)&spiData, sizeof(TelemetryPacket));
+  }
+}
+
+// Main Process Loop
+static void PingPong_Process(void)
+{
+  Radio.Sleep();
+
+  // If the ESP32 has sent us fresh data via SPI...
+  if (newSpiDataReady == true)
+  {
+    newSpiDataReady = false;
+
+    // 1. Verify Sync Headers to ensure we didn't miss a clock cycle
+    if (spiData.sync1 == 0xAA && spiData.sync2 == 0xBB)
+    {
+      // 2. Verify Checksum to ensure no data was corrupted by motor noise
+      if (spiData.checksum == CalculateChecksum(&spiData))
+      {
+        // Validation passed! Blast the 49-byte packet over LoRa!
+        Radio.Send((uint8_t *)&spiData, sizeof(TelemetryPacket));
+      }
+      else
+      {
+        APP_LOG(TS_OFF, VLEVEL_M, "SPI Error: Checksum mismatch!\r\n");
+      }
+    }
+    else
+    {
+      APP_LOG(TS_OFF, VLEVEL_M, "SPI Error: Sync bytes missing!\r\n");
+    }
+  }
+  else
+  {
+    // Wait slightly and check again
+    HAL_Delay(10);
+    UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
+  }
+}
+
 /* USER CODE END PrFD */
-
-/************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/
-
