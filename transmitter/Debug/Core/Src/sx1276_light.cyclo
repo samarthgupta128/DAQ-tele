@@ -1,0 +1,4 @@
+../Core/Src/sx1276_light.c:10:6:SX1276_WriteRegister	1
+../Core/Src/sx1276_light.c:20:9:SX1276_ReadRegister	1
+../Core/Src/sx1276_light.c:32:6:SX1276_Init	1
+../Core/Src/sx1276_light.c:62:6:SX1276_SendPacket	3
